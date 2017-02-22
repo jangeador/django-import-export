@@ -1,37 +1,34 @@
 from __future__ import with_statement
 
+import importlib
 from datetime import datetime
 
-import importlib
-import django
-from django.contrib import admin
-from django.utils import six
-from django.utils.translation import ugettext_lazy as _
-from django.conf.urls import url
-from django.template.response import TemplateResponse
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.admin.models import LogEntry, ADDITION, CHANGE, DELETION
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ImproperlyConfigured
+from django.db.models import QuerySet
 from django.http import HttpResponseRedirect, HttpResponse
-from django.core.urlresolvers import reverse
-from django.conf import settings
 from django.template.defaultfilters import pluralize
+from django.template.response import TemplateResponse
+from django.utils import six
 from django.utils.decorators import method_decorator
+from django.utils.translation import ugettext_lazy as _
 from django.views.decorators.http import require_POST
 
+from .formats import base_formats
 from .forms import (
     ImportForm,
     ConfirmImportForm,
     ExportForm,
-    export_action_form_factory,
 )
 from .resources import (
     modelresource_factory,
 )
-from .formats import base_formats
 from .results import RowResult
-from .tmp_storages import TempFolderStorage
 from .signals import post_export, post_import
+from .tmp_storages import TempFolderStorage
 
 try:
     from django.utils.encoding import force_text
@@ -68,6 +65,8 @@ DEFAULT_FORMATS = (
 
 class ImportExportMixinBase(object):
     model = None
+    queryset = None
+    ordering = None
 
     def get_model_info(self):
         # module_name is renamed to model_name in Django 1.8
@@ -96,6 +95,8 @@ class ImportMixin(ImportExportMixinBase):
     skip_admin_log = None
     # storage class for saving temporary files
     tmp_storage_class = None
+    # URL to redirect after finish
+    success_url = None
 
     def get_skip_admin_log(self):
         if self.skip_admin_log is None:
@@ -108,19 +109,6 @@ class ImportMixin(ImportExportMixinBase):
             return TMP_STORAGE_CLASS
         else:
             return self.tmp_storage_class
-
-    # def get_urls(self):
-    #     urls = super(ImportMixin, self).get_urls()
-    #     info = self.get_model_info()
-    #     my_urls = [
-    #         url(r'^process_import/$',
-    #             self.admin_site.admin_view(self.process_import),
-    #             name='%s_%s_process_import' % info),
-    #         url(r'^import/$',
-    #             self.admin_site.admin_view(self.import_action),
-    #             name='%s_%s_import' % info),
-    #     ]
-    #     return my_urls + urls
 
     def get_resource_kwargs(self, request, *args, **kwargs):
         return {}
@@ -145,6 +133,18 @@ class ImportMixin(ImportExportMixinBase):
         Returns available import formats.
         """
         return [f for f in self.formats if f().can_import()]
+
+    def get_success_url(self):
+        """
+        Returns the supplied success URL.
+        """
+        if self.success_url:
+            # Forcing possible reverse_lazy evaluation
+            url = force_text(self.success_url)
+        else:
+            raise ImproperlyConfigured(
+                "No URL to redirect to. Provide a success_url.")
+        return url
 
     @method_decorator(require_POST)
     def process_import(self, request, *args, **kwargs):
@@ -183,10 +183,8 @@ class ImportMixin(ImportExportMixinBase):
         self.generate_log_entries(result, request)
         self.add_success_message(result, request)
         post_import.send(sender=None, model=self.model)
-
-        url = reverse('admin:%s_%s_changelist' % self.get_model_info(),
-                      current_app=self.admin_site.name)
-        return HttpResponseRedirect(url)
+        print(self.get_success_url())
+        return HttpResponseRedirect(self.get_success_url())
 
     def generate_log_entries(self, result, request):
         if not self.get_skip_admin_log():
@@ -267,7 +265,8 @@ class ImportMixin(ImportExportMixinBase):
             except UnicodeDecodeError as e:
                 return HttpResponse(_(u"<h1>Imported file has a wrong encoding: %s</h1>" % e))
             except Exception as e:
-                return HttpResponse(_(u"<h1>%s encountered while trying to read file: %s</h1>" % (type(e).__name__, import_file.name)))
+                return HttpResponse(
+                    _(u"<h1>%s encountered while trying to read file: %s</h1>" % (type(e).__name__, import_file.name)))
             result = resource.import_data(dataset, dry_run=True,
                                           raise_errors=False,
                                           file_name=import_file.name,
@@ -307,15 +306,6 @@ class ExportMixin(ImportExportMixinBase):
     #: export data encoding
     to_encoding = "utf-8"
 
-    # def get_urls(self):
-    #     urls = super(ExportMixin, self).get_urls()
-    #     my_urls = [
-    #         url(r'^export/$',
-    #             self.admin_site.admin_view(self.export_action),
-    #             name='%s_%s_export' % self.get_model_info()),
-    #     ]
-    #     return my_urls + urls
-
     def get_resource_kwargs(self, request, *args, **kwargs):
         return {}
 
@@ -347,29 +337,40 @@ class ExportMixin(ImportExportMixinBase):
                                  file_format.get_extension())
         return filename
 
+    def get_queryset(self):
+        """
+        Return the list of items for this view.
+        The return value must be an iterable and may be an instance of
+        `QuerySet` in which case `QuerySet` specific behavior will be enabled.
+        """
+        if self.queryset is not None:
+            queryset = self.queryset
+            if isinstance(queryset, QuerySet):
+                queryset = queryset.all()
+        elif self.model is not None:
+            queryset = self.model._default_manager.all()
+        else:
+            raise ImproperlyConfigured(
+                "%(cls)s is missing a QuerySet. Define "
+                "%(cls)s.model, %(cls)s.queryset, or override "
+                "%(cls)s.get_queryset()." % {
+                    'cls': self.__class__.__name__
+                }
+            )
+        ordering = self.get_ordering()
+        if ordering:
+            if isinstance(ordering, six.string_types):
+                ordering = (ordering,)
+            queryset = queryset.order_by(*ordering)
+        return queryset
+
     def get_export_queryset(self, request):
         """
         Returns export queryset.
 
         Default implementation respects applied search and filters.
         """
-        # copied from django/contrib/admin/options.py
-        list_display = self.get_list_display(request)
-        list_display_links = self.get_list_display_links(request, list_display)
-
-        ChangeList = self.get_changelist(request)
-        cl = ChangeList(request, self.model, list_display,
-                        list_display_links, self.list_filter,
-                        self.date_hierarchy, self.search_fields,
-                        self.list_select_related, self.list_per_page,
-                        self.list_max_show_all, self.list_editable,
-                        self)
-
-        # query_set has been renamed to queryset in Django 1.8
-        try:
-            return cl.queryset
-        except AttributeError:
-            return cl.query_set
+        return self.get_queryset()
 
     def get_export_data(self, file_format, queryset, *args, **kwargs):
         """
@@ -412,15 +413,10 @@ class ExportMixin(ImportExportMixinBase):
 
         context = self.get_export_context_data()
 
-        # if django.VERSION >= (1, 8, 0):
-        #     context.update(self.admin_site.each_context(request))
-        # elif django.VERSION >= (1, 7, 0):
-        #     context.update(self.admin_site.each_context())
-
         context['title'] = _("Export")
         context['form'] = form
         context['opts'] = self.model._meta
-        request.current_app = self.admin_site.name
+        # request.current_app = self.admin_site.name
         return TemplateResponse(request, [self.export_template_name],
                                 context)
 

@@ -9,7 +9,7 @@
 
 {% block content %}
 {% if confirm_form %}
-  <form action="{% url opts|admin_urlname:"process_import" %}" method="POST">
+  <form action="" method="POST">
     {% csrf_token %}
     {{ confirm_form.as_p }}
     <p>
@@ -77,7 +77,7 @@
   <h2>
     {% trans "Preview" %}
   </h2>
-  <table>
+  <table class="table table-striped">
     <thead>
       <tr>
         <th></th>
